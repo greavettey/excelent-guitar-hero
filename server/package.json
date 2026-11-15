@@ -1,7 +1,7 @@
 {
-  "name": "xplorer-excel-vim-server",
-  "version": "2.0.0",
-  "description": "Guitar Hero X-Plorer BLE -> Node.js -> Strict Excel/Vim Keyboard Server with Rhythm, Note Highway, Star Power Tilt, Whammy Chaos, Baudot Chording, and Rock Meter",
+  "name": "xplorer-ble-server",
+  "version": "1.0.0",
+  "description": "Minimal BLE scanner, byte interpreter, and Win32 key injector for the ESP32-S3 X-Plorer bridge",
   "type": "module",
   "main": "src/server.js",
   "scripts": {

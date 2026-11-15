@@ -1,56 +1,94 @@
 /**
- * Node.js PC Bluetooth Server for Guitar Hero X-Plorer -> Excel & Vim Only.
- * Supports GATT notifications (--transport gatt) and connectionless AirTag sniffing (--transport beacon).
+ * Minimal BLE Scanner & Byte Interpreter for the ESP32-S3 X-Plorer Bridge.
+ * Supports GATT notifications (--transport gatt) and connectionless beacons (--transport beacon).
  */
 
-import readline from "node:readline";
 import { parseArgs } from "node:util";
-import { ChaosEngine } from "./chaosEngine.js";
-import { executeAction, releaseAllModifiers } from "./keyInjector.js";
-import { ChordProcessor, exportAllMappings, resolveAction } from "./mapper.js";
+import { DEMO_SEQUENCES, findDemoSequenceIndex } from "./demoSequence.js";
+import { releaseAllModifiers, sendClick, sendCombo, sendKey, sendText } from "./keyInjector.js";
+import { isEditingExcelCell } from "./excelState.js";
 import {
+  BIT_BACK,
+  BIT_BLUE,
+  BIT_DPAD_LEFT,
+  BIT_DPAD_RIGHT,
+  BIT_GREEN,
+  BIT_GUIDE,
+  BIT_ORANGE,
+  BIT_RED,
+  BIT_START,
+  BIT_STRUM_DOWN,
+  BIT_STRUM_UP,
+  BIT_YELLOW,
   DEVICE_NAME,
-  LED_BLOCKED,
-  LED_CHAR_UUID,
-  LED_EXCEL,
-  LED_VIM,
+  FRET_MASK,
   SERVICE_UUID,
   STATE_CHAR_UUID,
-  TOTAL_NONZERO_STATES,
+  TILT_MASK,
+  WHAMMY_MASK,
   decodeBeaconMfgData,
   decodePacket,
   formatBitmask,
+  getWhammyLevel,
 } from "./protocol.js";
-import { TargetApp, getForegroundWindowInfo } from "./windowGuard.js";
 
 function log(level, msg) {
   const ts = new Date().toTimeString().slice(0, 8);
   console.log(`${ts} [${level}] ${msg}`);
 }
 
-export class XPlorerNodeServer {
-  constructor({
-    transport = "gatt",
-    mode = "chord",
-    chaos = true,
-    bpm = 120,
-    rhythmToleranceMs = 135,
-    dryRun = false,
-    verbose = false,
-  } = {}) {
+function formatHexBytes(buf) {
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join(" ");
+}
+
+export class MinimalBleClient {
+  constructor({ transport = "gatt", changesOnly = false, dryRun = false, demo = false, demoSeq = 0 } = {}) {
     this.transport = transport;
+    this.changesOnly = changesOnly;
     this.dryRun = dryRun;
-    this.verbose = verbose;
-    this.processor = new ChordProcessor({ mode });
-    this.chaos = new ChaosEngine({
-      enabled: chaos,
-      bpm,
-      rhythmToleranceMs,
-      startTimeMs: Date.now(),
-    });
-    this._lastLedSent = null;
+    this.demo = demo;
+    this._demoSeqIndex = typeof demoSeq === "number" ? demoSeq : findDemoSequenceIndex(demoSeq);
+    this._demoIndex = 0;
+    this._demoBusy = false;
     this._lastBeaconSeq = -1;
+    this._lastMask = null;
+    this._lastUsb = null;
     this._stopped = false;
+  }
+
+  get activeDemoSequence() {
+    return DEMO_SEQUENCES[this._demoSeqIndex];
+  }
+
+  toggleDemo() {
+    this.demo = !this.demo;
+    if (this.demo) {
+      const seq = this.activeDemoSequence;
+      log(
+        "DEMO",
+        `Demo mode ON -> [${this._demoSeqIndex + 1}/${DEMO_SEQUENCES.length}] ${seq.name} (step ${this._demoIndex + 1}/${seq.steps.length})`
+      );
+    } else {
+      log("DEMO", "Demo mode OFF -> normal controller mappings active");
+    }
+    return this.demo;
+  }
+
+  nextDemoSequence() {
+    this._demoSeqIndex = (this._demoSeqIndex + 1) % DEMO_SEQUENCES.length;
+    this._demoIndex = 0;
+    const seq = this.activeDemoSequence;
+    log(
+      "DEMO",
+      `Switched sequence -> [${this._demoSeqIndex + 1}/${DEMO_SEQUENCES.length}] ${seq.name} (${seq.steps.length} steps)`
+    );
+    return seq;
+  }
+
+  resetDemo() {
+    this._demoIndex = 0;
+    const seq = this.activeDemoSequence;
+    log("DEMO", `Reset sequence [${seq.name}] to step 1/${seq.steps.length}`);
   }
 
   stop() {
@@ -58,110 +96,142 @@ export class XPlorerNodeServer {
     releaseAllModifiers();
   }
 
-  async _dispatchMask(bitmask, nowMs) {
-    const fg = getForegroundWindowInfo();
-    const rawAction = resolveAction(bitmask, fg.target);
-    const decision = this.chaos.evaluate(bitmask, fg.target, rawAction, nowMs);
+  /**
+   * Expand your bitmask -> key injection mappings here.
+   * 
+   
+   
+   * 
+   * 
+   */
+  handleBitmask(bitmask, prevMask = 0) {
+    if (bitmask === 0) return;
 
-    for (const msg of decision.logs) {
-      log(decision.outcome === "blocked_app" || decision.outcome === "locked_out" ? "WARN" : "CHAOS", msg);
+    const baseMask = bitmask & ~WHAMMY_MASK;
+    const prevBase = (prevMask ?? 0) & ~WHAMMY_MASK;
+    const newPressEdge = baseMask !== 0 && (baseMask & ~prevBase) !== 0;
+
+    // Live demo controls from the guitar (work in both normal and demo mode)
+    if (newPressEdge && baseMask === (BIT_GUIDE | BIT_START)) {
+      this.toggleDemo();
+      return;
     }
-    if (decision.highwayDisplay) {
-      console.log(decision.highwayDisplay);
+    if (newPressEdge && baseMask === (BIT_GUIDE | BIT_BACK)) {
+      this.nextDemoSequence();
+      return;
     }
 
-    if (fg.target === TargetApp.NONE) {
-      if (this.verbose || decision.logs.length === 0) {
-        log(
-          "BLOCK",
-          `Blocked mask=0x${bitmask.toString(16).padStart(5, "0")} (${formatBitmask(bitmask)}): active '${
-            fg.processName || "<none>"
-          }' is not Excel or Vim`
-        );
+    if (this.demo) {
+      if (!newPressEdge || this._demoBusy) return;
+
+      const seq = this.activeDemoSequence;
+      if (this._demoIndex >= seq.steps.length) {
+        log("DEMO", `[${seq.id}] Complete! Press 'r' + Enter to reset or GUIDE+BACK for next sequence.`);
+        return;
+      }
+
+      const step = seq.steps[this._demoIndex];
+      log("DEMO", `[${seq.id} ${this._demoIndex + 1}/${seq.steps.length}] ${step.label}`);
+      if (seq.noLoop) {
+        this._demoIndex += 1;
+      } else {
+        this._demoIndex = (this._demoIndex + 1) % seq.steps.length;
+      }
+      if (!this.dryRun) this._demoBusy = true;
+      Promise.resolve(step.run(this.dryRun))
+        .catch((err) => log("WARN", `Demo step failed: ${err.message}`))
+        .finally(() => {
+          this._demoBusy = false;
+        });
+      return;
+    }
+
+    // Whammy held (W2..W7): 5-bit binary fret chord (1..26) + strum -> a..z / A..Z
+    const whammy = getWhammyLevel(bitmask);
+    if (whammy >= 2) {
+      const frets = bitmask & FRET_MASK;
+      const strumDownEdge = Boolean((bitmask & BIT_STRUM_DOWN) && !(prevMask & BIT_STRUM_DOWN));
+      const strumUpEdge = Boolean((bitmask & BIT_STRUM_UP) && !(prevMask & BIT_STRUM_UP));
+
+      if (frets >= 1 && frets <= 26) {
+        if (strumDownEdge) {
+          sendText(String.fromCharCode(96 + frets), { dryRun: this.dryRun });
+        } else if (strumUpEdge) {
+          sendText(String.fromCharCode(64 + frets), { dryRun: this.dryRun });
+        }
       }
       return;
     }
 
-    if (!decision.actionToSend) return;
+    // Normal neck/body combos (ignore W0/W1 resting whammy jitter)
+    if (baseMask === 0 || baseMask === prevBase) return;
 
-    const sent = await executeAction(decision.actionToSend, fg.target, { dryRun: this.dryRun });
-    const status = this.dryRun ? "DRY-RUN" : sent ? "SENT" : "ABORTED (focus changed)";
+    if (baseMask === (BIT_ORANGE | BIT_STRUM_DOWN)) sendKey("space", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_BLUE | BIT_ORANGE)) sendKey("tab", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GREEN | BIT_YELLOW | BIT_ORANGE)) sendKey("esc", { dryRun: this.dryRun });
+    else if (baseMask === FRET_MASK) {
+      sendCombo(["ctrl", "s"], { dryRun: this.dryRun });
+      sendCombo(["ctrl", "w"], { dryRun: this.dryRun });
+    }
+    else if (baseMask === BIT_DPAD_LEFT) sendKey("left", { dryRun: this.dryRun });
+    else if (baseMask === BIT_DPAD_RIGHT) sendKey("right", { dryRun: this.dryRun });
+    else if (baseMask === BIT_STRUM_UP) sendKey("up", { dryRun: this.dryRun });
+    else if (baseMask === BIT_STRUM_DOWN) sendKey("down", { dryRun: this.dryRun });
+    else if (baseMask === BIT_BACK) sendClick("left", { dryRun: this.dryRun });
+    else if (baseMask === BIT_START) sendClick("right", { dryRun: this.dryRun });
+
+    // Common Excel shortcuts & formulas (GUIDE + fret / strum)
+    else if (baseMask === (BIT_GUIDE | BIT_GREEN)) sendKey("enter", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_RED)) sendKey("f2", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_YELLOW)) sendCombo(["ctrl", "z"], { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_BLUE)) sendCombo(["ctrl", "c"], { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_ORANGE)) sendCombo(["ctrl", "v"], { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_GREEN | BIT_STRUM_DOWN)) sendText("=SUM(", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_RED | BIT_STRUM_DOWN)) sendText("=AVERAGE(", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_YELLOW | BIT_STRUM_DOWN)) sendText("=COUNT(", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_BLUE | BIT_STRUM_DOWN)) sendText("=IF(", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_ORANGE | BIT_STRUM_DOWN)) sendText("=XLOOKUP(", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_STRUM_UP)) sendCombo(["alt", "="], { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_STRUM_DOWN)) sendCombo(["ctrl", ";"], { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_DPAD_LEFT)) sendKey("backspace", { dryRun: this.dryRun });
+    else if (baseMask === (BIT_GUIDE | BIT_DPAD_RIGHT)) sendKey("delete", { dryRun: this.dryRun });
+  }
+
+  onPacket(pkt, rawBuf) {
+    const bitmask = pkt.bitmask & ~TILT_MASK;
+    const changed = bitmask !== this._lastMask || pkt.usbConnected !== this._lastUsb;
+    if (this.changesOnly && !changed) {
+      return;
+    }
+
+    const prevMask = this._lastMask;
+    this._lastMask = bitmask;
+    this._lastUsb = pkt.usbConnected;
+
+    const maskHex = `0x${bitmask.toString(16).padStart(5, "0")}`;
+    const buttons = formatBitmask(bitmask);
+    const whammyLvl = getWhammyLevel(bitmask);
+
     log(
-      fg.target.toUpperCase(),
-      `${formatBitmask(bitmask)} (0x${bitmask.toString(16).padStart(5, "0")}) -> ${
-        decision.actionToSend.name
-      } [${status}]`
+      "DATA",
+      `seq=${pkt.seq} usb=${pkt.usbConnected ? 1 : 0} mask=${maskHex} (${buttons}) ` +
+        `whammy=${pkt.whammyRaw}[W${whammyLvl}] | bytes=[${formatHexBytes(rawBuf)}]`
     );
-  }
 
-  async _handleIncomingPacket(pkt, nowMs) {
-    const fg = getForegroundWindowInfo();
-    const whammyAct = this.chaos.processWhammyVibrato(pkt.bitmask, fg.target, nowMs);
-    if (whammyAct) {
-      const sent = await executeAction(whammyAct, fg.target, { dryRun: this.dryRun });
-      if (sent) {
-        log(fg.target.toUpperCase(), `${whammyAct.name} [${this.dryRun ? "DRY-RUN" : "SENT"}]`);
-      }
-    }
-
-    for (const mask of this.processor.feed(pkt.bitmask, nowMs)) {
-      await this._dispatchMask(mask, nowMs);
+    if (bitmask !== prevMask) {
+      this.handleBitmask(bitmask, prevMask ?? 0);
     }
   }
 
-  async _syncLed(ledChar) {
-    if (!ledChar) return;
-    const fg = getForegroundWindowInfo();
-    const desired =
-      fg.target === TargetApp.EXCEL ? LED_EXCEL : fg.target === TargetApp.VIM ? LED_VIM : LED_BLOCKED;
-    if (desired !== this._lastLedSent) {
-      try {
-        await ledChar.writeAsync(Buffer.from([desired]), true);
-        this._lastLedSent = desired;
-      } catch {
-        // Ignore transient write errors
-      }
-    }
-  }
-
-  async runBle() {
+  async run() {
     const { default: noble } = await import("@stoprocent/noble");
-    let ledChar = null;
-    let tickTimer = null;
-    let beatTimer = null;
-
-    const startTimers = () => {
-      if (tickTimer) return;
-      tickTimer = setInterval(async () => {
-        if (this._stopped) return;
-        const now = Date.now();
-        for (const mask of this.processor.tick(now)) {
-          await this._dispatchMask(mask, now);
-        }
-        await this._syncLed(ledChar);
-      }, 10);
-
-      if (this.chaos.enabled && this.verbose) {
-        beatTimer = setInterval(() => {
-          if (!this._stopped) process.stdout.write("♪ ");
-        }, this.chaos.beatPeriodMs);
-      }
-    };
-
-    const cleanupTimers = () => {
-      if (tickTimer) clearInterval(tickTimer);
-      if (beatTimer) clearInterval(beatTimer);
-      tickTimer = null;
-      beatTimer = null;
-    };
 
     return new Promise((resolve) => {
       noble.on("stateChange", async (state) => {
         if (state === "poweredOn") {
           if (this.transport === "beacon") {
-            log("INFO", `AirTag Beacon mode: passively sniffing BLE advertisements from '${DEVICE_NAME}'...`);
+            log("INFO", `Beacon mode: scanning for '${DEVICE_NAME}' manufacturer data...`);
             await noble.startScanningAsync([], true);
-            startTimers();
           } else {
             log("INFO", `GATT mode: scanning for '${DEVICE_NAME}' (service ${SERVICE_UUID})...`);
             await noble.startScanningAsync([SERVICE_UUID], false);
@@ -188,7 +258,7 @@ export class XPlorerNodeServer {
           }
           if (pkt.seq === this._lastBeaconSeq) return;
           this._lastBeaconSeq = pkt.seq;
-          await this._handleIncomingPacket(pkt, Date.now());
+          this.onPacket(pkt, adv.manufacturerData);
           return;
         }
 
@@ -196,38 +266,36 @@ export class XPlorerNodeServer {
 
         try {
           await noble.stopScanningAsync();
-          log("INFO", `Found '${name || peripheral.id}', connecting via GATT...`);
+          log("INFO", `Found '${name || peripheral.id}', connecting...`);
           await peripheral.connectAsync();
-          log("INFO", "Connected to ESP32-S3 X-Plorer BLE bridge!");
+          log("INFO", "Connected! Discovering state characteristic...");
 
           const { characteristics } = await peripheral.discoverSomeServicesAndCharacteristicsAsync(
             [SERVICE_UUID],
-            [STATE_CHAR_UUID, LED_CHAR_UUID]
+            [STATE_CHAR_UUID]
           );
           const stateChar = characteristics.find((c) => c.uuid.toLowerCase() === STATE_CHAR_UUID);
-          ledChar = characteristics.find((c) => c.uuid.toLowerCase() === LED_CHAR_UUID) || null;
           if (!stateChar) {
-            throw new Error("State characteristic not found on ESP32");
+            throw new Error(`Characteristic ${STATE_CHAR_UUID} not found`);
           }
 
-          stateChar.on("data", async (data) => {
+          stateChar.on("data", (data) => {
+            let pkt;
             try {
-              const pkt = decodePacket(data);
-              await this._handleIncomingPacket(pkt, Date.now());
+              pkt = decodePacket(data);
             } catch (err) {
-              log("WARN", `Dropped malformed BLE packet: ${err.message}`);
+              log("WARN", `Malformed packet [${formatHexBytes(data)}]: ${err.message}`);
+              return;
             }
+            this.onPacket(pkt, data);
           });
 
           await stateChar.subscribeAsync();
-          startTimers();
+          log("INFO", "Subscribed to controller state notifications.");
 
           peripheral.once("disconnect", async () => {
-            log("WARN", "ESP32 disconnected; releasing modifiers and rescanning...");
-            ledChar = null;
-            this._lastLedSent = null;
+            log("WARN", "Disconnected; rescanning...");
             releaseAllModifiers();
-            cleanupTimers();
             if (!this._stopped) {
               await noble.startScanningAsync([SERVICE_UUID], false);
             } else {
@@ -235,37 +303,13 @@ export class XPlorerNodeServer {
             }
           });
         } catch (err) {
-          log("WARN", `BLE connection error: ${err.message}`);
-          ledChar = null;
-          cleanupTimers();
+          log("WARN", `BLE error: ${err.message}`);
           if (!this._stopped) {
             setTimeout(() => noble.startScanningAsync([SERVICE_UUID], false).catch(() => {}), 1500);
           }
         }
       });
     });
-  }
-
-  async runSimulate() {
-    log(
-      "INFO",
-      `Simulation mode active (${TOTAL_NONZERO_STATES} valid permutations, chaos=${this.chaos.enabled}, bpm=${this.chaos.bpm}).`
-    );
-    log("INFO", "Focus Excel or Vim (or another app to trigger Rock Meter shame), enter hex bitmask (e.g. 0x00041) or 'q':");
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: "bitmask> " });
-    rl.prompt();
-    for await (const rawLine of rl) {
-      const line = rawLine.trim();
-      if (!line || ["q", "quit", "exit"].includes(line.toLowerCase())) break;
-      const mask = Number(line);
-      if (!Number.isInteger(mask) || mask < 0) {
-        console.log("Invalid bitmask. Try e.g. 0x00041");
-      } else {
-        await this._dispatchMask(mask, Date.now());
-      }
-      rl.prompt();
-    }
-    rl.close();
   }
 }
 
@@ -274,15 +318,10 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
     args: argv,
     options: {
       transport: { type: "string", default: "gatt" },
-      mode: { type: "string", default: "chord" },
-      vanilla: { type: "boolean", default: false },
-      bpm: { type: "string", default: "120" },
-      "rhythm-window": { type: "string", default: "135" },
+      "changes-only": { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
-      simulate: { type: "boolean", default: false },
-      "export-map": { type: "string" },
-      "export-format": { type: "string", default: "csv" },
-      verbose: { type: "boolean", default: false },
+      demo: { type: "boolean", default: false },
+      "demo-seq": { type: "string", default: "battle" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
@@ -290,20 +329,20 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
 }
 
 function printHelp() {
-  console.log(`Guitar Hero X-Plorer Node.js -> Excel/Vim-Only Keyboard Server
+  const seqList = DEMO_SEQUENCES.map((s, i) => `${i + 1}:${s.id}`).join(", ");
+  console.log(`Minimal X-Plorer BLE Scanner, Byte Interpreter & Key Injector
 
 Options:
-  --transport <gatt|beacon>  BLE transport: connected GATT (default) or connectionless AirTag beacon sniffing
-  --mode <chord|raw>         Trigger mode: 'chord' (40ms settle + strum + repeat) or 'raw'
-  --vanilla                  Disable rhythm/tilt/riff/rock-meter chaos mechanics
-  --bpm <number>             Metronome tempo in BPM (default: 120)
-  --rhythm-window <ms>       Beat hit tolerance in ms (default: 135)
-  --dry-run                  Resolve and gate against Excel/Vim without calling SendInput
-  --simulate                 Interactive hex bitmask simulator without Bluetooth hardware
-  --export-map <path>        Export all 55,295 bitmask mappings (csv/json) and exit
-  --export-format <csv|json> Format for --export-map (default: csv)
-  --verbose                  Show metronome beats & debug logs
-  -h, --help                 Show this help`);
+  --transport <gatt|beacon>  BLE transport: connected GATT (default) or connectionless beacon
+  --changes-only             Only log packets when bitmask or USB connection state changes
+  --dry-run                  Decode packets without calling Win32 SendInput
+  --demo                     Start in demo mode (any button/strum advances the Excel sequence)
+  --demo-seq <name|index>    Demo sequence to load (${seqList})
+  -h, --help                 Show this help
+
+Live Demo Controls (available even when launched without --demo):
+  Guitar:   GUIDE + START = toggle demo mode ON/OFF | GUIDE + BACK = cycle sequence
+  Terminal: d + Enter = toggle demo | n + Enter = next sequence | r + Enter = reset step`);
 }
 
 async function main() {
@@ -313,33 +352,37 @@ async function main() {
     return 0;
   }
 
-  if (args["export-map"]) {
-    const count = exportAllMappings(args["export-map"], args["export-format"]);
-    log("INFO", `Exported ${count} bitmask mappings to ${args["export-map"]} (${args["export-format"]})`);
-    return 0;
-  }
-
-  const server = new XPlorerNodeServer({
+  const client = new MinimalBleClient({
     transport: args.transport,
-    mode: args.mode,
-    chaos: !args.vanilla,
-    bpm: Number(args.bpm),
-    rhythmToleranceMs: Number(args["rhythm-window"]),
+    changesOnly: args["changes-only"],
     dryRun: args["dry-run"],
-    verbose: args.verbose,
+    demo: args.demo,
+    demoSeq: args["demo-seq"],
   });
 
+  if (args.demo) {
+    const seq = client.activeDemoSequence;
+    log("INFO", `Demo mode ON: ${seq.name} (${seq.steps.length} steps). GUIDE+START toggles OFF, GUIDE+BACK switches sequence.`);
+  } else {
+    log("INFO", "Normal mode. Press GUIDE+START on guitar (or 'd' + Enter here) anytime to toggle Demo mode.");
+  }
+
+  if (process.stdin.isTTY) {
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => {
+      const cmd = chunk.trim().toLowerCase();
+      if (cmd === "d") client.toggleDemo();
+      else if (cmd === "n") client.nextDemoSequence();
+      else if (cmd === "r") client.resetDemo();
+    });
+  }
+
   process.on("SIGINT", () => {
-    server.stop();
+    client.stop();
     process.exit(0);
   });
 
-  if (args.simulate) {
-    await server.runSimulate();
-    return 0;
-  }
-
-  await server.runBle();
+  await client.run();
   return 0;
 }
 

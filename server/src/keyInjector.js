@@ -1,20 +1,15 @@
 /**
- * Win32 SendInput keyboard injector via Koffi FFI with strict per-step Excel/Vim verification.
+ * Minimal Win32 SendInput keyboard injector via Koffi FFI.
+ * Provides sendKey(), sendCombo(), sendText(), and releaseAllModifiers()
+ * without application-specific window restrictions.
  */
 
 import koffi from "koffi";
-import { TargetApp, getForegroundWindowInfo } from "./windowGuard.js";
 
 export const VK_MAP = {
   ctrl: 0x11,
-  lctrl: 0xa2,
-  rctrl: 0xa3,
   shift: 0x10,
-  lshift: 0xa0,
-  rshift: 0xa1,
   alt: 0x12,
-  lalt: 0xa4,
-  ralt: 0xa5,
   win: 0x5b,
 
   backspace: 0x08,
@@ -32,7 +27,6 @@ export const VK_MAP = {
   down: 0x28,
   insert: 0x2d,
   delete: 0x2e,
-  apps: 0x5d,
 
   f1: 0x70,
   f2: 0x71,
@@ -49,162 +43,50 @@ export const VK_MAP = {
 
   ";": 0xba,
   "=": 0xbb,
-  ",": 0xbc,
-  "-": 0xbd,
-  ".": 0xbe,
-  "/": 0xbf,
-  "`": 0xc0,
-  "[": 0xdb,
-  "\\": 0xdc,
-  "]": 0xdd,
-  "'": 0xde,
 };
 
-for (const ch of "0123456789") {
-  VK_MAP[ch] = ch.charCodeAt(0);
+for (let c = 65; c <= 90; c++) {
+  VK_MAP[String.fromCharCode(c).toLowerCase()] = c;
 }
-for (const ch of "abcdefghijklmnopqrstuvwxyz") {
-  VK_MAP[ch] = ch.toUpperCase().charCodeAt(0);
+for (let c = 48; c <= 57; c++) {
+  VK_MAP[String.fromCharCode(c)] = c;
 }
 
-export const MODIFIER_KEYS = new Set([
-  "ctrl",
-  "lctrl",
-  "rctrl",
-  "shift",
-  "lshift",
-  "rshift",
-  "alt",
-  "lalt",
-  "ralt",
-  "win",
-]);
+const INPUT_MOUSE = 0;
+const INPUT_KEYBOARD = 1;
+const KEYEVENTF_EXTENDEDKEY = 0x0001;
+const KEYEVENTF_KEYUP = 0x0002;
+const KEYEVENTF_UNICODE = 0x0004;
+
+const MOUSE_BUTTON_FLAGS = {
+  left: { down: 0x0002, up: 0x0004 },
+  right: { down: 0x0008, up: 0x0010 },
+  middle: { down: 0x0020, up: 0x0040 },
+};
 
 const EXTENDED_VKS = new Set([
-  0x21, 0x22, 0x23, 0x24,
-  0x25, 0x26, 0x27, 0x28,
-  0x2d, 0x2e,
-  0x5b, 0x5d,
-  0xa3, 0xa5,
+  0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2d, 0x2e, 0x5b,
 ]);
 
-export function chord(...keys) {
-  return { kind: "chord", keys: keys.map((k) => k.toLowerCase()) };
-}
+let _user32 = null;
+let _SendInput = null;
+let _SetCursorPos = null;
+let _INPUT = null;
 
-export function text(str) {
-  return { kind: "text", text: str };
-}
+function ensureWin32() {
+  if (_SendInput) return true;
+  if (process.platform !== "win32") return false;
 
-export function repeat(...args) {
-  // repeat("up", 5) or repeat("ctrl", "right", 3)
-  const count = args[args.length - 1];
-  const keys = args.slice(0, -1).map((k) => k.toLowerCase());
-  return { kind: "repeat", keys, count };
-}
+  _user32 = koffi.load("user32.dll");
 
-export function makeAction(name, steps, { category = "", requiresRiff = false, requiresStarPower = false } = {}) {
-  return { name, steps, category, requiresRiff, requiresStarPower };
-}
-
-export function actionChord(name, ...keysAndOpts) {
-  let opts = {};
-  let keys = keysAndOpts;
-  if (typeof keysAndOpts[keysAndOpts.length - 1] === "object") {
-    opts = keysAndOpts[keysAndOpts.length - 1];
-    keys = keysAndOpts.slice(0, -1);
-  }
-  return makeAction(name, [chord(...keys)], opts);
-}
-
-export function actionText(name, s, opts = {}) {
-  return makeAction(name, [text(s)], opts);
-}
-
-export function actionEx(name, cmd, opts = {}) {
-  return makeAction(name, [text(cmd), chord("enter")], { category: "Vim Ex", ...opts });
-}
-
-export function actionRibbon(name, ...tipsAndOpts) {
-  let opts = {};
-  let tips = tipsAndOpts;
-  if (typeof tipsAndOpts[tipsAndOpts.length - 1] === "object") {
-    opts = tipsAndOpts[tipsAndOpts.length - 1];
-    tips = tipsAndOpts.slice(0, -1);
-  }
-  const steps = [chord("alt"), ...tips.map((k) => chord(k))];
-  return makeAction(name, steps, { category: "Excel Ribbon", ...opts });
-}
-
-export function actionGoto(name, cellRef, opts = {}) {
-  return makeAction(name, [chord("f5"), text(cellRef), chord("enter")], {
-    category: "Excel GoTo",
-    ...opts,
+  const KEYBDINPUT = koffi.struct("KEYBDINPUT", {
+    wVk: "uint16",
+    wScan: "uint16",
+    dwFlags: "uint32",
+    time: "uint32",
+    dwExtraInfo: "uintptr_t",
   });
-}
 
-export function canonicalSignature(act) {
-  return act.steps
-    .map((s) => {
-      if (s.kind === "chord") return `C(${s.keys.join(",")})`;
-      if (s.kind === "text") return `T(${JSON.stringify(s.text)})`;
-      if (s.kind === "repeat") return `R(${s.keys.join(",")}*${s.count})`;
-      throw new Error(`Unknown step kind: ${s.kind}`);
-    })
-    .join("|");
-}
-
-export function displayKeys(act) {
-  return act.steps
-    .map((s) => {
-      if (s.kind === "chord") return s.keys.map((k) => (k.length > 1 ? k.toUpperCase() : k)).join("+");
-      if (s.kind === "text") return s.text;
-      if (s.kind === "repeat") {
-        const combo = s.keys.map((k) => (k.length > 1 ? k.toUpperCase() : k)).join("+");
-        return `${combo}x${s.count}`;
-      }
-      return "";
-    })
-    .join(" ");
-}
-
-export function validateAction(act) {
-  if (!act || !act.name) throw new Error("Action must have a non-empty name");
-  if (!Array.isArray(act.steps) || act.steps.length === 0) {
-    throw new Error(`Action ${JSON.stringify(act.name)} has no steps`);
-  }
-  for (const step of act.steps) {
-    if (step.kind === "chord" || step.kind === "repeat") {
-      if (!step.keys || step.keys.length === 0) {
-        throw new Error(`Empty keys in action ${JSON.stringify(act.name)}`);
-      }
-      for (const k of step.keys) {
-        if (!(k in VK_MAP)) {
-          throw new Error(`Unknown key ${JSON.stringify(k)} in action ${JSON.stringify(act.name)}`);
-        }
-      }
-      if (step.kind === "repeat" && !(step.count > 0)) {
-        throw new Error(`Repeat count must be > 0 in action ${JSON.stringify(act.name)}`);
-      }
-    } else if (step.kind === "text") {
-      if (!step.text) throw new Error(`Empty text step in action ${JSON.stringify(act.name)}`);
-    } else {
-      throw new Error(`Invalid step kind ${step.kind}`);
-    }
-  }
-}
-
-let sendApi = null;
-
-export function getSendInputStructSize() {
-  initSendApi();
-  return sendApi ? koffi.sizeof(sendApi.INPUT) : 0;
-}
-
-function initSendApi() {
-  if (sendApi || process.platform !== "win32") return sendApi;
-
-  const user32 = koffi.load("user32.dll");
   const MOUSEINPUT = koffi.struct("MOUSEINPUT", {
     dx: "int32",
     dy: "int32",
@@ -213,153 +95,170 @@ function initSendApi() {
     time: "uint32",
     dwExtraInfo: "uintptr_t",
   });
-  const KEYBDINPUT = koffi.struct("KEYBDINPUT", {
-    wVk: "uint16",
-    wScan: "uint16",
-    dwFlags: "uint32",
-    time: "uint32",
-    dwExtraInfo: "uintptr_t",
-  });
+
   const HARDWAREINPUT = koffi.struct("HARDWAREINPUT", {
     uMsg: "uint32",
     wParamL: "uint16",
     wParamH: "uint16",
   });
+
   const INPUT_UNION = koffi.union("INPUT_UNION", {
     mi: MOUSEINPUT,
     ki: KEYBDINPUT,
     hi: HARDWAREINPUT,
   });
-  const INPUT = koffi.struct("INPUT", {
+
+  _INPUT = koffi.struct("INPUT", {
     type: "uint32",
     u: INPUT_UNION,
   });
 
-  sendApi = {
-    INPUT,
-    INPUT_SIZE: koffi.sizeof(INPUT),
-    SendInput: user32.func("uint32 __stdcall SendInput(uint32 cInputs, INPUT *pInputs, int cbSize)"),
-    MapVirtualKeyW: user32.func("uint32 __stdcall MapVirtualKeyW(uint32 uCode, uint32 uMapType)"),
-  };
-  return sendApi;
-}
-
-const INPUT_KEYBOARD = 1;
-const KEYEVENTF_EXTENDEDKEY = 0x0001;
-const KEYEVENTF_KEYUP = 0x0002;
-const KEYEVENTF_UNICODE = 0x0004;
-const MAPVK_VK_TO_VSC = 0;
-
-function makeVkInput(api, vk, keyUp = false) {
-  let flags = keyUp ? KEYEVENTF_KEYUP : 0;
-  if (EXTENDED_VKS.has(vk)) flags |= KEYEVENTF_EXTENDEDKEY;
-  const scan = api.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-  return {
-    type: INPUT_KEYBOARD,
-    u: { ki: { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
-  };
-}
-
-function makeUnicodeInput(codeUnit, keyUp = false) {
-  const flags = KEYEVENTF_UNICODE | (keyUp ? KEYEVENTF_KEYUP : 0);
-  return {
-    type: INPUT_KEYBOARD,
-    u: { ki: { wVk: 0, wScan: codeUnit, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
-  };
-}
-
-export function defaultSendInputs(inputs) {
-  if (!inputs || inputs.length === 0 || process.platform !== "win32") return 0;
-  const api = initSendApi();
-  const sent = api.SendInput(inputs.length, inputs, api.INPUT_SIZE);
-  if (sent !== inputs.length) {
-    throw new Error(`SendInput sent ${sent}/${inputs.length} events`);
-  }
-  return sent;
-}
-
-function buildChordEvents(api, keys) {
-  const mods = keys.filter((k) => MODIFIER_KEYS.has(k)).map((k) => VK_MAP[k]);
-  const primaries = keys.filter((k) => !MODIFIER_KEYS.has(k)).map((k) => VK_MAP[k]);
-  const events = [];
-  for (const m of mods) events.push(makeVkInput(api, m, false));
-  for (const p of primaries) {
-    events.push(makeVkInput(api, p, false));
-    events.push(makeVkInput(api, p, true));
-  }
-  for (const m of [...mods].reverse()) events.push(makeVkInput(api, m, true));
-  return events;
-}
-
-function buildUnicodeEvents(str) {
-  const buf = Buffer.from(str, "utf16le");
-  const events = [];
-  for (let i = 0; i < buf.length; i += 2) {
-    const unit = buf.readUInt16LE(i);
-    events.push(makeUnicodeInput(unit, false));
-    events.push(makeUnicodeInput(unit, true));
-  }
-  return events;
-}
-
-export function releaseAllModifiers(sendFn = defaultSendInputs) {
-  if (process.platform !== "win32") return;
-  const api = initSendApi();
-  const events = ["ctrl", "shift", "alt"].map((m) => makeVkInput(api, VK_MAP[m], true));
-  sendFn(events);
-}
-
-function sleepMs(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export async function executeAction(
-  action,
-  expectedTarget,
-  {
-    dryRun = false,
-    stepDelayMs = 15,
-    getFgInfo = getForegroundWindowInfo,
-    sendFn = defaultSendInputs,
-    releaseFn = releaseAllModifiers,
-  } = {}
-) {
-  if (expectedTarget !== TargetApp.EXCEL && expectedTarget !== TargetApp.VIM) {
-    return false;
-  }
-
-  validateAction(action);
-  if (dryRun) return true;
-
-  const api = initSendApi();
-  for (let idx = 0; idx < action.steps.length; idx++) {
-    const fg = getFgInfo();
-    if (fg.target !== expectedTarget) {
-      releaseFn(sendFn);
-      return false;
-    }
-
-    const step = action.steps[idx];
-    if (step.kind === "chord") {
-      sendFn(buildChordEvents(api, step.keys));
-    } else if (step.kind === "text") {
-      sendFn(buildUnicodeEvents(step.text));
-    } else if (step.kind === "repeat") {
-      for (let r = 0; r < step.count; r++) {
-        if (r > 0 && r % 4 === 0) {
-          if (getFgInfo().target !== expectedTarget) {
-            releaseFn(sendFn);
-            return false;
-          }
-        }
-        sendFn(buildChordEvents(api, step.keys));
-      }
-    }
-
-    if (idx + 1 < action.steps.length && stepDelayMs > 0) {
-      await sleepMs(stepDelayMs);
-    }
-  }
-
+  _SendInput = _user32.func("uint32 __stdcall SendInput(uint32 cInputs, INPUT *pInputs, int cbSize)");
+  _SetCursorPos = _user32.func("bool __stdcall SetCursorPos(int X, int Y)");
   return true;
+}
+
+function makeVkEvent(vk, isUp = false) {
+  let flags = isUp ? KEYEVENTF_KEYUP : 0;
+  if (EXTENDED_VKS.has(vk)) flags |= KEYEVENTF_EXTENDEDKEY;
+  return {
+    type: INPUT_KEYBOARD,
+    u: {
+      ki: {
+        wVk: vk,
+        wScan: 0,
+        dwFlags: flags,
+        time: 0,
+        dwExtraInfo: 0,
+      },
+    },
+  };
+}
+
+function makeUnicodeEvent(codeUnit, isUp = false) {
+  return {
+    type: INPUT_KEYBOARD,
+    u: {
+      ki: {
+        wVk: 0,
+        wScan: codeUnit,
+        dwFlags: KEYEVENTF_UNICODE | (isUp ? KEYEVENTF_KEYUP : 0),
+        time: 0,
+        dwExtraInfo: 0,
+      },
+    },
+  };
+}
+
+function makeMouseEvent(dwFlags, { dx = 0, dy = 0, mouseData = 0 } = {}) {
+  return {
+    type: INPUT_MOUSE,
+    u: {
+      mi: {
+        dx,
+        dy,
+        mouseData,
+        dwFlags,
+        time: 0,
+        dwExtraInfo: 0,
+      },
+    },
+  };
+}
+
+function dispatchInputs(events) {
+  if (!events.length) return 0;
+  if (!ensureWin32()) return 0;
+  return _SendInput(events.length, events, koffi.sizeof(_INPUT));
+}
+
+export function resolveVk(key) {
+  if (typeof key === "number") return key;
+  const vk = VK_MAP[String(key).toLowerCase()];
+  if (vk === undefined) {
+    throw new Error(`Unknown key name: '${key}'`);
+  }
+  return vk;
+}
+
+/**
+ * Tap a single key (e.g., "a", "enter", "up", "f5").
+ */
+export function sendKey(key, { dryRun = false } = {}) {
+  const vk = resolveVk(key);
+  if (dryRun) return true;
+  return dispatchInputs([makeVkEvent(vk, false), makeVkEvent(vk, true)]) === 2;
+}
+
+/**
+ * Press a key combination (e.g., ["ctrl", "c"], ["alt", "tab"]).
+ */
+export function sendCombo(keys, { dryRun = false } = {}) {
+  const vks = keys.map(resolveVk);
+  if (dryRun) return true;
+  const events = [];
+  for (const vk of vks) events.push(makeVkEvent(vk, false));
+  for (let i = vks.length - 1; i >= 0; i--) events.push(makeVkEvent(vks[i], true));
+  return dispatchInputs(events) === events.length;
+}
+
+/**
+ * Type arbitrary Unicode text.
+ */
+export function sendText(text, { dryRun = false } = {}) {
+  if (!text) return true;
+  if (dryRun) return true;
+  const events = [];
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    events.push(makeUnicodeEvent(code, false), makeUnicodeEvent(code, true));
+  }
+  return dispatchInputs(events) === events.length;
+}
+
+/**
+ * Move the mouse cursor to screen pixel coordinates (x, y).
+ */
+export function moveMouse(x, y, { dryRun = false } = {}) {
+  const px = Math.round(Number(x));
+  const py = Math.round(Number(y));
+  if (!Number.isFinite(px) || !Number.isFinite(py)) {
+    throw new Error(`Invalid mouse coordinates: (${x}, ${y})`);
+  }
+  if (dryRun) return true;
+  if (!ensureWin32()) return false;
+  return Boolean(_SetCursorPos(px, py));
+}
+
+/**
+ * Send a mouse click ("left", "right", or "middle"), optionally at (x, y).
+ */
+export function sendClick(button = "left", { x = null, y = null, count = 1, dryRun = false } = {}) {
+  const btn = MOUSE_BUTTON_FLAGS[String(button).toLowerCase()];
+  if (!btn) {
+    throw new Error(`Unknown mouse button: '${button}'`);
+  }
+  const clicks = Math.max(1, Math.floor(count));
+  if (x !== null && y !== null) {
+    if (!moveMouse(x, y, { dryRun })) return false;
+  }
+  if (dryRun) return true;
+  const events = [];
+  for (let i = 0; i < clicks; i++) {
+    events.push(makeMouseEvent(btn.down), makeMouseEvent(btn.up));
+  }
+  return dispatchInputs(events) === events.length;
+}
+
+/**
+ * Release stuck modifier keys (call on disconnect or SIGINT).
+ */
+export function releaseAllModifiers() {
+  if (process.platform !== "win32") return;
+  dispatchInputs([
+    makeVkEvent(VK_MAP.ctrl, true),
+    makeVkEvent(VK_MAP.shift, true),
+    makeVkEvent(VK_MAP.alt, true),
+    makeVkEvent(VK_MAP.win, true),
+  ]);
 }
