@@ -1,6 +1,6 @@
-# Guitar Hero X-Plorer → ESP32-S3 → Node.js Bridge Documentation
+# Guitar Hero Controller (xplorer) → ESP32-S3 → Node.js Bridge Documentation
 
-Reference documentation for the **ESP32-S3 firmware** (`firmware/`) and the **minimal Node.js BLE server** (`server/`).
+reference documentation for the ESP32-S3 firmware (`firmware/`) and the node.js bt server (`server/`).
 
 ---
 
