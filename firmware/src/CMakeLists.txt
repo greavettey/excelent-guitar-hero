@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "xplorer_usb.c"
+        "ble_server.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_driver_gpio
+        bt
+        nvs_flash
+        esp_timer
+)
